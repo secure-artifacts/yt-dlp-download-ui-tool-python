@@ -18,6 +18,8 @@ import time
 BASE_DIR = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).parent
 YTDLP    = BASE_DIR / "yt-dlp.exe"
 FFMPEG   = BASE_DIR / "ffmpeg.exe"
+DENO     = BASE_DIR / "deno.exe"
+CONFIG_FILE = BASE_DIR / "config.json"
 
 # ─────────────────────────── colour palette ───────────────────────
 BG        = "#0f0f13"
@@ -147,6 +149,7 @@ class App(tk.Tk):
         self._formats: list[FormatRow] = []
         self._dl_thread: threading.Thread | None = None
         self._stop_event = threading.Event()
+        self._is_fetching = False
         self.cookies_path = tk.StringVar(value="")
         self.save_dir     = tk.StringVar(value=str(Path.home() / "Downloads"))
         self.url_var      = tk.StringVar()
@@ -156,13 +159,109 @@ class App(tk.Tk):
         self.thumbnail    = tk.BooleanVar(value=False)
         self.speed_limit  = tk.StringVar(value="")
 
-        self._build_ui()
-        self._check_ytdlp()
+        self._load_config()
+        self.protocol("WM_DELETE_WINDOW", self._on_closing)
 
-    # ─────────────────────── ytdlp check ──────────────────────────
-    def _check_ytdlp(self):
+        self._build_ui()
+        self._check_dependencies()
+
+    # ─────────────────────── config ───────────────────────────────
+    def _load_config(self):
+        if CONFIG_FILE.exists():
+            try:
+                with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                    config = json.load(f)
+                if "cookies_path" in config: self.cookies_path.set(config["cookies_path"])
+                if "save_dir" in config: self.save_dir.set(config["save_dir"])
+                if "audio_only" in config: self.audio_only.set(config["audio_only"])
+                if "subtitle" in config: self.subtitle.set(config["subtitle"])
+                if "thumbnail" in config: self.thumbnail.set(config["thumbnail"])
+                if "speed_limit" in config: self.speed_limit.set(config["speed_limit"])
+            except Exception as e:
+                print(f"Error loading config: {e}")
+
+    def _save_config(self):
+        config = {
+            "cookies_path": self.cookies_path.get(),
+            "save_dir": self.save_dir.get(),
+            "audio_only": self.audio_only.get(),
+            "subtitle": self.subtitle.get(),
+            "thumbnail": self.thumbnail.get(),
+            "speed_limit": self.speed_limit.get()
+        }
+        try:
+            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+                json.dump(config, f, indent=4, ensure_ascii=False)
+        except Exception as e:
+            print(f"Error saving config: {e}")
+
+    def _on_closing(self):
+        self._save_config()
+        self._stop_event.set()
+        self.destroy()
+
+    # ─────────────────────── dependencies check ──────────────────────────
+    def _check_dependencies(self):
+        if not FFMPEG.exists():
+            self._log(f"⚠  ffmpeg.exe 未找到！高画质视频下载后可能无法自动合并音频，请将其放置到: {FFMPEG}", "warn")
+
         if not YTDLP.exists():
-            self._log(f"⚠  yt-dlp.exe 未找到，请放置到: {YTDLP}", WARNING)
+            self._log(f"⚠  yt-dlp.exe 未找到，请放置到: {YTDLP}", "warn")
+        else:
+            threading.Thread(target=self._update_ytdlp_thread, daemon=True).start()
+
+        # Deno detection
+        deno = self._find_deno()
+        if deno:
+            self._log(f"✅  Deno 已找到: {deno}", "ok")
+            self._deno_status_label.config(text=f"✅ Deno: {Path(deno).name}", fg=SUCCESS)
+        else:
+            self._log(
+                "⚠  未找到 deno.exe！某些平台（YouTube 等）需要 Deno 才能获取格式列表。\n"
+                "   请将 deno.exe 放到程序同目录，或点击右侧「下载 Deno」按钮。",
+                "warn"
+            )
+            self._deno_status_label.config(text="⚠ Deno 未安装", fg=WARNING)
+
+    def _find_deno(self):
+        """Return path to deno.exe if found in BASE_DIR or system PATH, else None."""
+        import shutil
+        if DENO.exists():
+            return str(DENO)
+        found = shutil.which("deno")
+        return found  # None if not found
+
+    def _update_ytdlp_thread(self):
+        self.after(0, self._log, "🔄  正在检查 yt-dlp 更新...", "info")
+        try:
+            cmd = [str(YTDLP), "-U"]
+            result = subprocess.run(
+                cmd, capture_output=True, text=True,
+                encoding="utf-8", errors="replace",
+                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
+
+            output = result.stdout + result.stderr
+            if "up to date" in output or "is up to date" in output:
+                self.after(0, self._log, "✅  yt-dlp 已是最新版本", "ok")
+            elif "Updated yt-dlp" in output or "Updating to version" in output:
+                self.after(0, self._log, "✨  yt-dlp 更新成功！", "ok")
+                self.after(0, messagebox.showinfo, "更新完成", "yt-dlp 已自动更新到最新版本！")
+            elif result.returncode != 0:
+                self.after(0, self._log, f"❌  yt-dlp 更新失败:\n{output.strip()}", "err")
+            else:
+                self.after(0, self._log, f"ℹ️  yt-dlp 更新检查结果:\n{output.strip()}", "info")
+        except Exception as e:
+            self.after(0, self._log, f"❌  检查更新异常: {e}", "err")
+
+    def _download_deno(self):
+        """Open browser to Deno releases page for manual download."""
+        import webbrowser
+        webbrowser.open("https://github.com/denoland/deno/releases/latest")
+        self._log(
+            "🌐  已打开 Deno 下载页面，请下载 deno-x86_64-pc-windows-msvc.zip，\n"
+            f"   解压后将 deno.exe 放到: {BASE_DIR}",
+            "info"
+        )
 
     # ─────────────────────────── UI ───────────────────────────────
     def _build_ui(self):
@@ -233,17 +332,35 @@ class App(tk.Tk):
         self._checkbtn(inner, "下载封面缩略图", self.thumbnail)
 
         ttk.Separator(inner, orient="horizontal").pack(fill="x", pady=8)
+        self._section_label(inner, "🦕  Deno (JS 解释器)")
+
+        # Deno status label
+        self._deno_status_label = tk.Label(
+            inner, text="🔍 检测中...",
+            font=FONT_SMALL, fg=SUBTEXT, bg=BG2, anchor="w"
+        )
+        self._deno_status_label.pack(fill="x", pady=(0, 4))
+
+        RoundedButton(inner, text="📥  下载 Deno",
+                      command=self._download_deno,
+                      bg="#2d4a3e", hover_bg="#3a6b56",
+                      width=200, height=30,
+                      font=FONT_SMALL).pack(pady=(0, 4))
+
+        ttk.Separator(inner, orient="horizontal").pack(fill="x", pady=8)
 
         # action buttons
-        RoundedButton(inner, text="🔍  获取格式列表",
+        self._fetch_btn = RoundedButton(inner, text="🔍  获取格式列表",
                       command=self._fetch_formats,
                       bg=ACCENT2, width=200, height=38,
-                      font=FONT_BODY).pack(pady=4)
+                      font=FONT_BODY)
+        self._fetch_btn.pack(pady=4)
 
-        RoundedButton(inner, text="⬇  开始下载",
+        self._dl_btn = RoundedButton(inner, text="⬇  开始下载",
                       command=self._start_download,
                       bg=ACCENT, width=200, height=38,
-                      font=("Segoe UI", 10, "bold")).pack(pady=4)
+                      font=("Segoe UI", 10, "bold"))
+        self._dl_btn.pack(pady=4)
 
         RoundedButton(inner, text="⏹  停止",
                       command=self._stop_download,
@@ -309,6 +426,9 @@ class App(tk.Tk):
                  highlightcolor=ACCENT, highlightbackground=BORDER).pack(
             side="left", fill="x", expand=True, ipady=5)
         RoundedButton(row, text="选择", command=self._browse_save_dir,
+                      bg=BG3, width=56, height=30, radius=7,
+                      font=FONT_SMALL).pack(side="right", padx=(6, 0))
+        RoundedButton(row, text="打开", command=self._open_save_dir,
                       bg=BG3, width=56, height=30, radius=7,
                       font=FONT_SMALL).pack(side="right", padx=(6, 0))
 
@@ -412,6 +532,14 @@ class App(tk.Tk):
         if d:
             self.save_dir.set(d)
 
+    def _open_save_dir(self):
+        d = self.save_dir.get()
+        if d and Path(d).exists():
+            try:
+                os.startfile(d)
+            except Exception as e:
+                self._log(f"❌ 无法打开文件夹: {e}", "err")
+
     # ── logging ────────────────────────────────────────────────────
     def _log(self, msg, tag=""):
         self._log_text.configure(state="normal")
@@ -448,26 +576,50 @@ class App(tk.Tk):
     #  FETCH FORMATS
     # ══════════════════════════════════════════════════════════════
     def _fetch_formats(self):
+        if getattr(self, "_is_fetching", False):
+            self._log("⏳  正在获取，请不要重复点击...", "warn")
+            return
+
         url = self.url_var.get().strip()
         if not url or url.startswith("粘贴"):
             messagebox.showwarning("提示", "请先输入 YouTube 链接")
             return
+
+        self._is_fetching = True
+        # disable buttons during fetch
+        self._fetch_btn.bg = "#3a3a55"
+        self._fetch_btn._draw("#3a3a55")
         self._log(f"🔍  正在获取格式列表: {url}", "info")
         self._format_combo.set("正在获取…")
         threading.Thread(target=self._fetch_thread, args=(url,), daemon=True).start()
 
     def _fetch_thread(self, url):
         try:
-            cmd = [str(YTDLP), "--dump-json", "--no-playlist", url]
+            cmd = [str(YTDLP), "--dump-json", "--no-playlist"]
+
+            # Pass deno path so yt-dlp can use it as JS interpreter
+            deno = self._find_deno()
+            if deno:
+                cmd += ["--extractor-args", f"youtube:player_client=web"]
+
             if self.cookies_path.get():
                 cmd += ["--cookies", self.cookies_path.get()]
+            cmd.append(url)
+
             result = subprocess.run(
                 cmd, capture_output=True, text=True,
                 encoding="utf-8", errors="replace",
                 creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
             if result.returncode != 0:
                 err = result.stderr.strip().splitlines()
-                self.after(0, self._log, f"❌  获取失败: {err[-1] if err else '未知错误'}", "err")
+                last_err = err[-1] if err else "未知错误"
+                # Give a hint if the error is about missing JS interpreter
+                if "deno" in last_err.lower() or "jsinterp" in last_err.lower() \
+                        or "format" in last_err.lower():
+                    hint = "\n💡 提示：将 deno.exe 放到程序同目录可解决此问题"
+                else:
+                    hint = ""
+                self.after(0, self._log, f"❌  获取失败: {last_err}{hint}", "err")
                 self.after(0, self._format_combo.set, "— 获取失败 —")
                 return
             data = json.loads(result.stdout)
@@ -480,6 +632,14 @@ class App(tk.Tk):
         except Exception as e:
             self.after(0, self._log, f"❌  异常: {e}", "err")
             self.after(0, self._format_combo.set, "— 获取失败 —")
+        finally:
+            self._is_fetching = False
+            # re-enable fetch button
+            self.after(0, self._restore_fetch_btn)
+
+    def _restore_fetch_btn(self):
+        self._fetch_btn.bg = ACCENT2
+        self._fetch_btn._draw(ACCENT2)
 
     def _populate_formats(self, formats: list[FormatRow], title: str):
         self._formats = formats
@@ -614,7 +774,9 @@ class App(tk.Tk):
         self._progress_label.config(text="✅  下载完成！", fg=SUCCESS)
         self._speed_label.config(text="")
         self._log("✅  下载完成！文件已保存到: " + self.save_dir.get(), "ok")
-        messagebox.showinfo("完成", f"下载完毕！\n保存到: {self.save_dir.get()}")
+        
+        if messagebox.askyesno("下载完成", f"视频下载完毕！\n\n已保存至:\n{self.save_dir.get()}\n\n是否立即打开该文件夹？"):
+            self._open_save_dir()
 
 
 # ══════════════════════════════════════════════════════════════════
