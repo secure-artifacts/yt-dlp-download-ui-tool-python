@@ -177,6 +177,7 @@ class App(tk.Tk):
                 if "subtitle" in config: self.subtitle.set(config["subtitle"])
                 if "thumbnail" in config: self.thumbnail.set(config["thumbnail"])
                 if "speed_limit" in config: self.speed_limit.set(config["speed_limit"])
+                self._last_update_check = config.get("last_update_check", 0)
             except Exception as e:
                 print(f"Error loading config: {e}")
 
@@ -187,7 +188,8 @@ class App(tk.Tk):
             "audio_only": self.audio_only.get(),
             "subtitle": self.subtitle.get(),
             "thumbnail": self.thumbnail.get(),
-            "speed_limit": self.speed_limit.get()
+            "speed_limit": self.speed_limit.get(),
+            "last_update_check": getattr(self, "_last_update_check", 0)
         }
         try:
             with open(CONFIG_FILE, "w", encoding="utf-8") as f:
@@ -208,7 +210,15 @@ class App(tk.Tk):
         if not YTDLP.exists():
             self._log(f"⚠  yt-dlp.exe 未找到，请放置到: {YTDLP}", "warn")
         else:
-            threading.Thread(target=self._update_ytdlp_thread, daemon=True).start()
+            # 只在距上次检查超过 1 周后才自动执行更新
+            now = time.time()
+            last = getattr(self, "_last_update_check", 0)
+            if now - last >= 604800:  # 604800 秒 = 7 天
+                threading.Thread(target=self._update_ytdlp_thread, daemon=True).start()
+            else:
+                remaining_days = int((604800 - (now - last)) / 86400)
+                remaining_hrs  = int(((604800 - (now - last)) % 86400) / 3600)
+                self._log(f"ℹ️  yt-dlp 自动更新已跳过（距上次检查不足 7 天，还剩约 {remaining_days} 天 {remaining_hrs} 小时）", "info")
 
         # Deno detection
         deno = self._find_deno()
@@ -233,6 +243,7 @@ class App(tk.Tk):
 
     def _update_ytdlp_thread(self):
         self.after(0, self._log, "🔄  正在检查 yt-dlp 更新...", "info")
+        self.after(0, self._set_update_btn_state, False)
         try:
             cmd = [str(YTDLP), "-U"]
             result = subprocess.run(
@@ -242,16 +253,58 @@ class App(tk.Tk):
 
             output = result.stdout + result.stderr
             if "up to date" in output or "is up to date" in output:
+                self._last_update_check = time.time()
+                self._save_config()
                 self.after(0, self._log, "✅  yt-dlp 已是最新版本", "ok")
             elif "Updated yt-dlp" in output or "Updating to version" in output:
+                self._last_update_check = time.time()
+                self._save_config()
                 self.after(0, self._log, "✨  yt-dlp 更新成功！", "ok")
                 self.after(0, messagebox.showinfo, "更新完成", "yt-dlp 已自动更新到最新版本！")
+            elif "rate limit" in output.lower() or "403" in output:
+                # 遇到速率限制时，推迟 6 小时后再次尝试（距 7 天终点倒退 6 小时）
+                self._last_update_check = time.time() - 604800 + 21600
+                self._save_config()
+                self.after(0, self._log, "⚠️  yt-dlp 更新检查被 GitHub 限速，将在 6 小时后重试", "warn")
             elif result.returncode != 0:
                 self.after(0, self._log, f"❌  yt-dlp 更新失败:\n{output.strip()}", "err")
             else:
+                self._last_update_check = time.time()
+                self._save_config()
                 self.after(0, self._log, f"ℹ️  yt-dlp 更新检查结果:\n{output.strip()}", "info")
         except Exception as e:
             self.after(0, self._log, f"❌  检查更新异常: {e}", "err")
+        finally:
+            self.after(0, self._refresh_update_status_label)
+            self.after(0, self._set_update_btn_state, True)
+
+    def _manual_check_update(self):
+        """Trigger an immediate update check, bypassing the weekly cooldown."""
+        if not YTDLP.exists():
+            messagebox.showwarning("提示", f"yt-dlp.exe 未找到，请先将其放到:\n{YTDLP}")
+            return
+        threading.Thread(target=self._update_ytdlp_thread, daemon=True).start()
+
+    def _set_update_btn_state(self, enabled: bool):
+        """Enable or disable the manual update button."""
+        if not hasattr(self, "_check_update_btn"):
+            return
+        color = "#2d3a5e" if enabled else "#1e2333"
+        self._check_update_btn.bg = color
+        self._check_update_btn.text = "🔄  检查 yt-dlp 更新" if enabled else "⏳  检查中..."
+        self._check_update_btn._draw(color)
+        self._check_update_btn.command = self._manual_check_update if enabled else None
+
+    def _refresh_update_status_label(self):
+        """Update the last-check timestamp display in the right panel."""
+        if not hasattr(self, "_update_status_label"):
+            return
+        last = getattr(self, "_last_update_check", 0)
+        if last == 0:
+            self._update_status_label.config(text="从未检查过", fg=SUBTEXT)
+        else:
+            t = time.strftime("%Y-%m-%d %H:%M", time.localtime(last))
+            self._update_status_label.config(text=f"上次检查: {t}", fg=SUBTEXT)
 
     def _download_deno(self):
         """Open browser to Deno releases page for manual download."""
@@ -332,6 +385,23 @@ class App(tk.Tk):
         self._checkbtn(inner, "下载封面缩略图", self.thumbnail)
 
         ttk.Separator(inner, orient="horizontal").pack(fill="x", pady=8)
+        self._section_label(inner, "🔧  yt-dlp 更新")
+
+        self._update_status_label = tk.Label(
+            inner, text="", font=FONT_SMALL, fg=SUBTEXT, bg=BG2, anchor="w"
+        )
+        self._update_status_label.pack(fill="x", pady=(0, 4))
+        self._refresh_update_status_label()
+
+        self._check_update_btn = RoundedButton(
+            inner, text="🔄  检查 yt-dlp 更新",
+            command=self._manual_check_update,
+            bg="#2d3a5e", hover_bg="#3a4f80",
+            width=200, height=30,
+            font=FONT_SMALL)
+        self._check_update_btn.pack(pady=(0, 4))
+
+        ttk.Separator(inner, orient="horizontal").pack(fill="x", pady=8)
         self._section_label(inner, "🦕  Deno (JS 解释器)")
 
         # Deno status label
@@ -350,17 +420,17 @@ class App(tk.Tk):
         ttk.Separator(inner, orient="horizontal").pack(fill="x", pady=8)
 
         # action buttons
-        self._fetch_btn = RoundedButton(inner, text="🔍  获取格式列表",
-                      command=self._fetch_formats,
-                      bg=ACCENT2, width=200, height=38,
-                      font=FONT_BODY)
-        self._fetch_btn.pack(pady=4)
-
         self._dl_btn = RoundedButton(inner, text="⬇  开始下载",
                       command=self._start_download,
                       bg=ACCENT, width=200, height=38,
                       font=("Segoe UI", 10, "bold"))
         self._dl_btn.pack(pady=4)
+
+        self._fetch_btn = RoundedButton(inner, text="🔍  获取所有格式",
+                      command=self._fetch_formats,
+                      bg=ACCENT2, width=200, height=34,
+                      font=FONT_SMALL)
+        self._fetch_btn.pack(pady=4)
 
         RoundedButton(inner, text="⏹  停止",
                       command=self._stop_download,
@@ -389,8 +459,15 @@ class App(tk.Tk):
         card = self._card(parent)
         self._section_label(card, "🎬  画质 / 格式选择")
 
-        # dropdown
-        self._combo_var = tk.StringVar(value="— 请先点击「获取格式列表」—")
+        # hint label
+        hint = tk.Label(card,
+                        text="💡 直接选择格式后点击「开始下载」，或先点击「获取所有格式」查看视频支持的格式",
+                        font=FONT_SMALL, fg=SUBTEXT, bg=self._card_bg,
+                        anchor="w", wraplength=480, justify="left")
+        hint.pack(fill="x", pady=(0, 4))
+
+        # dropdown — pre-filled with smart presets
+        self._combo_var = tk.StringVar(value="✨ 自动最佳画质 (bestvideo+bestaudio)")
         style = ttk.Style()
         style.theme_use("clam")
         style.configure("Dark.TCombobox",
@@ -405,6 +482,8 @@ class App(tk.Tk):
         self._format_combo = ttk.Combobox(card, textvariable=self._combo_var,
                                            state="readonly", style="Dark.TCombobox",
                                            font=FONT_BODY)
+        # populate default presets immediately
+        self._format_combo["values"] = list(self._PRESET_MAP.keys())
         self._format_combo.pack(fill="x", ipady=5, pady=(4, 4))
         self._format_combo.bind("<<ComboboxSelected>>", self._on_format_select)
 
@@ -644,26 +723,25 @@ class App(tk.Tk):
     def _populate_formats(self, formats: list[FormatRow], title: str):
         self._formats = formats
         labels = [f.label for f in formats]
-        # prepend smart presets
-        presets = [
-            "✨ 自动最佳画质 (bestvideo+bestaudio)",
-            "🎵 仅音频 (bestaudio)",
-            "📱 720p (bestvideo[height<=720]+bestaudio)",
-            "📱 480p (bestvideo[height<=480]+bestaudio)",
-        ]
-        all_labels = presets + labels
+        # prepend smart presets, then append all specific formats
+        all_labels = list(self._PRESET_MAP.keys()) + labels
         self._format_combo["values"] = all_labels
-        self._format_combo.set(all_labels[0])
-        self.sel_format.set("bestvideo+bestaudio/best")
+        # keep current selection if it's still valid, otherwise pick first preset
+        current = self._combo_var.get()
+        if current not in all_labels:
+            self._format_combo.set(all_labels[0])
+            self.sel_format.set("bestvideo+bestaudio/best")
         self._format_info.config(text=f"视频标题: {title}")
         self._log(f"✓  共找到 {len(formats)} 种格式  |  {title}", "ok")
 
-    # preset id map
+    # preset id map — defined as class variable so it can be used during _build_format_section
     _PRESET_MAP = {
         "✨ 自动最佳画质 (bestvideo+bestaudio)": "bestvideo+bestaudio/best",
         "🎵 仅音频 (bestaudio)": "bestaudio/best",
+        "📺 1080p (bestvideo[height<=1080]+bestaudio)": "bestvideo[height<=1080]+bestaudio/best",
         "📱 720p (bestvideo[height<=720]+bestaudio)": "bestvideo[height<=720]+bestaudio/best",
         "📱 480p (bestvideo[height<=480]+bestaudio)": "bestvideo[height<=480]+bestaudio/best",
+        "📱 360p (bestvideo[height<=360]+bestaudio)": "bestvideo[height<=360]+bestaudio/best",
     }
 
     def _resolve_format(self):
